@@ -3,7 +3,8 @@ from src.chat.get_prompt import (
     get_customer_info_analysis_prompt,
     get_icebreak_suggestion_prompt,
     get_search_keywords_prompt,
-    get_web_research_summarize_prompt
+    get_web_research_summarize_prompt,
+    get_article_selection_prompt
 )
 from src.websearch.web_search import WebSearch
 from src.tiktoken import count_tokens
@@ -19,7 +20,7 @@ from firebase_admin import firestore
 from firebase_admin import credentials
 from src.firestore.firestore_adapter import FirestoreAdapter
 
-credentials_path = f"./secret-key/{os.getenv('CLOUD_FIRESTORE_JSON')}.json"
+credentials_path = f"./secret-key/{os.getenv('CLOUD_FIRESTORE_JSON')}"
 cred = credentials.Certificate(credentials_path)
 app = firebase_admin.initialize_app(cred)
 db = firestore.client()
@@ -35,9 +36,10 @@ db = firestore.client()
 # 詳細
 # ・全ページの記事を取得
 # ・記事のタイトルとURLを取得
-
 # ・データベースで取得済みの記事を除外する → 過去に一度でも取得した記事は除外する
 # ・AIで関係しそうな記事の選択
+# ・選択した記事のタイトルとURLをデータベースに保存
+
 # ・URL先の「・・・記事全文を読む」のURLから記事全文を取得
 # ・AIで関係しそうな記事の選択
 # ・データベースをチェックし、取得済みの記事かどうかをチェックする→記事タイトル及びURL検索
@@ -83,15 +85,117 @@ def main():
     logger = logging.getLogger(__name__)
 
     try:
-        # スクレイパーの初期化
+        # スクレイパーとFirestoreAdapterの初期化
         yns = YahooNewsScraper()
+        fa = FirestoreAdapter()
         
         # すべてのカテゴリの記事を取得（結果を保存）
         logger.info("Starting to scrape Yahoo News categories...")
         results = yns.scrape_all_categories(save_results=True)
         
+        # 既存の記事を取得
+        logger.info("Fetching existing articles from Firestore...")
+        existing_articles = fa.get_discovered_articles(db)
+        existing_urls = {article['url'] for article in existing_articles}
+        
+        # 新規記事のフィルタリングと保存
+        logger.info("Filtering and saving new articles...")
+        new_articles = []
+        for category, articles in results.items():
+            for article in articles:
+                # 既存の記事と重複していない場合のみ追加
+                if article['url'] not in existing_urls:
+                    new_articles.append(article)
+                    logger.info(f"Found new article: {article['title']}")
+
+        # 新規記事を一括で保存
+        if new_articles:
+            fa.save_discovered_articles_batch(db, new_articles)
+            logger.info(f"Saved {len(new_articles)} new articles in batch")
+            
+            # 記事選別のための前処理
+            logger.info("Starting article selection process...")
+            numbered_articles = []
+            article_text = ""
+            
+            for i, article in enumerate(new_articles, 1):
+                numbered_articles.append({
+                    "number": i,
+                    "title": article["title"],
+                    "url": article["url"]
+                })
+                article_text += f"{i}. {article['title']}\n"
+            
+            # OpenAI APIを使用して記事を選別
+            openai = OpenaiAdapter()
+            selection_prompt = get_article_selection_prompt()
+            selection_response = openai.openai_chat(
+                openai_model="gpt-4o",
+                prompt=selection_prompt + "\n\n" + article_text
+            )
+            
+            try:
+                # 選択された記事番号を抽出
+                selection_start = selection_response.find("<selected_articles>") + len("<selected_articles>")
+                selection_end = selection_response.find("</selected_articles>")
+                selected_numbers = json.loads(selection_response[selection_start:selection_end])
+                
+                # 選択理由を抽出
+                reasoning_start = selection_response.find("<reasoning>") + len("<reasoning>")
+                reasoning_end = selection_response.find("</reasoning>")
+                selection_reasoning = selection_response[reasoning_start:reasoning_end].strip()
+                
+                # 選択された記事の有無をチェック
+                if not selected_numbers:
+                    logger.info("\n選別結果：")
+                    logger.info("保険営業の時事ネタとして適切な記事は見つかりませんでした。")
+                    logger.info(f"\n理由：\n{selection_reasoning}")
+                else:
+                    # 選択された記事を表示
+                    logger.info("\n選別結果：")
+                    logger.info(f"保険営業の時事ネタとして {len(selected_numbers)} 件の記事が選択されました。")
+                    
+                    # 選択された記事のリストを作成
+                    selected_articles = []
+                    for num in selected_numbers:
+                        article = next((a for a in numbered_articles if a["number"] == num), None)
+                        if article:
+                            selected_articles.append({
+                                "title": article["title"],
+                                "url": article["url"]
+                            })
+                            logger.info(f"\n{article['number']}. {article['title']}")
+                            logger.info(f"   URL: {article['url']}")
+                    
+                    logger.info(f"\n選択理由：\n{selection_reasoning}")
+                    
+                    # 過去の参照記事を取得
+                    logger.info("過去の参照記事を取得中...")
+                    referenced_articles = fa.get_referenced_articles(db)
+                    referenced_urls = {article['url'] for article in referenced_articles}
+                    
+                    # 新規の参照記事をフィルタリング
+                    new_referenced_articles = [
+                        article for article in selected_articles
+                        if article['url'] not in referenced_urls
+                    ]
+                    
+                    # 新規の参照記事があれば保存
+                    if new_referenced_articles:
+                        logger.info(f"{len(new_referenced_articles)}件の新規参照記事を保存中...")
+                        fa.save_referenced_articles_batch(db, new_referenced_articles)
+                        logger.info("新規参照記事の保存が完了しました。")
+                    else:
+                        logger.info("新規の参照記事はありませんでした。")
+                
+            except json.JSONDecodeError as e:
+                logger.error(f"Error parsing selection response: {str(e)}")
+                logger.error(f"Raw response: {selection_response}")
+            except Exception as e:
+                logger.error(f"Error processing selection: {str(e)}")
+        
         # 結果の表示
-        display_results(results)
+        # display_results(results)
 
     except Exception as e:
         logger.error(f"Error occurred: {str(e)}", exc_info=True)
