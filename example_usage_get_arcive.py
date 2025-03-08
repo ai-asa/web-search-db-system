@@ -4,7 +4,8 @@ from src.chat.get_prompt import (
     get_icebreak_suggestion_prompt,
     get_search_keywords_prompt,
     get_web_research_summarize_prompt,
-    get_article_selection_prompt
+    get_article_selection_prompt,
+    get_article_grouping_prompt
 )
 from src.websearch.web_search import WebSearch
 from src.tiktoken import count_tokens
@@ -18,9 +19,12 @@ import json
 import firebase_admin
 from firebase_admin import firestore
 from firebase_admin import credentials
-from src.firestore.firestore_adapter import FirestoreAdapter
+from src.firestore.firestore_adapter import FirestoreAdapter 
+from pathlib import Path
+import platform
 
-credentials_path = f"./secret-key/{os.getenv('CLOUD_FIRESTORE_JSON')}"
+# 認証情報のパスを設定
+credentials_path = str(Path("secret-key") / f"{os.getenv('CLOUD_FIRESTORE_JSON')}.json")
 cred = credentials.Certificate(credentials_path)
 app = firebase_admin.initialize_app(cred)
 db = firestore.client()
@@ -39,6 +43,30 @@ db = firestore.client()
 # ・データベースで取得済みの記事を除外する → 過去に一度でも取得した記事は除外する
 # ・AIで関係しそうな記事の選択
 # ・選択した記事のタイトルとURLをデータベースに保存
+# ・記事の選定を行う → 記事の内容被り対策
+
+# 特定のURLから「・・・記事全文を読む」のURLを取得
+# 同様のページから、関連記事のURLを取得
+
+# 記事の本文を取得するスクリプトの作成
+
+
+# グループトピックについて
+# 記事タイトルから、本質情報を含んでいるかを判断する？
+# 記事が複数ある場合はそれでできそうだけど、数が少ない場合はそれが難しそう
+# →　記事を全て読み込む？？　→　コストが大きい　→　2つだけ記事を読み込んで、本質情報が含まれているかを判断する
+# 含まれていない場合、そのグループトピックは除外する
+# 含まれている場合、以下の処理を行う
+# 同じグループの記事数が複数ある場合、被るサブトピックは全て排除する
+# →　5件以下の場合はサブトピックを含め、全件を分割読込して、本質情報を抽出する　→　最後に本質情報について十分な情報があるかも判断し、無い場合は検索キーワードの抽出、検索による補完
+# →　5件以上の場合は、サブトピックを除外し、全件を分割読込して、本質情報を抽出する
+
+# 単体トピックについて
+# →　メイントピックの記事のみを読み込んで、保険営業アイスブレイクに使える時事ネタを得たいという視点における本質情報が記事に存在するかを分析する
+# →　存在し、サブトピックがある場合は、メインとサブの両方を読み込んでAIによる本質情報の抽出を行う。十分な情報があるかどうかも同時に判断し、十分な情報がない場合は、検索キーワードの抽出、検索による補完
+# →　存在し、サブトピックがない場合は、本質情報について検索キーワードをAI生成し、検索結果のスクレイピングで、対象情報を整理する
+
+
 
 # ・URL先の「・・・記事全文を読む」のURLから記事全文を取得
 # ・AIで関係しそうな記事の選択
@@ -48,7 +76,6 @@ db = firestore.client()
 # ・判定結果が正なら、記事のタイトルとURLをデータベースに保存
 # ・記事の中で、保険営業に関係していそうな本質情報があれば、ウェブ検索する
 # ・ウェブ検索結果を要約し、保険営業に関係している本質情報だった場合は、保存期間を設定してデータベースに保存
-
 # ・いくつかのバッチ単位で記事の内容をAIで要約してデータベースに保存
 # ・時事性の強い記事は1週間経過で削除
 # ・制度変更など、時事性が強くない記事は1年間は削除しない
@@ -79,332 +106,273 @@ def display_results(results: dict):
         if len(articles) > 5:
             print(f"  ... 他 {len(articles) - 5}件")
 
+def scrape_news_articles(yns: YahooNewsScraper) -> dict:
+    """
+    Yahoo Newsから記事をスクレイピングします
+
+    Args:
+        yns (YahooNewsScraper): YahooNewsScraperインスタンス
+
+    Returns:
+        dict: カテゴリごとの記事リスト
+    """
+    logger = logging.getLogger(__name__)
+    logger.info("Starting to scrape Yahoo News categories...")
+    return yns.scrape_all_categories(save_results=True)
+
+def filter_new_articles(articles_by_category: dict, fa: FirestoreAdapter) -> list:
+    """
+    既存の記事を除外し、新規記事のみをフィルタリングします
+
+    Args:
+        articles_by_category (dict): カテゴリごとの記事リスト
+        fa (FirestoreAdapter): FirestoreAdapterインスタンス
+
+    Returns:
+        list: 新規記事のリスト
+    """
+    logger = logging.getLogger(__name__)
+    logger.info("Fetching existing articles from Firestore...")
+    existing_articles = fa.get_discovered_articles(db)
+    existing_urls = {article['url'] for article in existing_articles}
+
+    new_articles = []
+    for category, articles in articles_by_category.items():
+        for article in articles:
+            if article['url'] not in existing_urls:
+                new_articles.append(article)
+                logger.info(f"Found new article: {article['title']}")
+
+    return new_articles
+
+def process_article_batch(batch_articles: list, batch_start: int) -> list:
+    """
+    記事バッチを処理し、関連する記事を選別します
+
+    Args:
+        batch_articles (list): 処理する記事のバッチ
+        batch_start (int): バッチの開始インデックス
+
+    Returns:
+        list: 選別された記事のリスト
+    """
+    logger = logging.getLogger(__name__)
+    numbered_articles = []
+    article_text = ""
+
+    for i, article in enumerate(batch_articles, batch_start + 1):
+        numbered_articles.append({
+            "number": i,
+            "title": article["title"],
+            "url": article["url"]
+        })
+        article_text += f"{i}. {article['title']}\n"
+
+    openai = OpenaiAdapter()
+    selection_prompt = get_article_selection_prompt()
+    selection_response = openai.openai_chat(
+        openai_model="gpt-4o",
+        prompt=selection_prompt + "\n\n" + article_text
+    )
+
+    try:
+        selection_start = selection_response.find("<selected_articles>") + len("<selected_articles>")
+        selection_end = selection_response.find("</selected_articles>")
+        selected_numbers_str = selection_response[selection_start:selection_end].strip()
+
+        selected_numbers_str = selected_numbers_str.replace('[', '').replace(']', '')
+        selected_numbers = []
+        if selected_numbers_str:
+            for num_str in selected_numbers_str.replace(',', ' ').split():
+                try:
+                    num = int(num_str.strip())
+                    selected_numbers.append(num)
+                except ValueError as ve:
+                    logger.warning(f"Invalid number format found: {num_str}")
+                    continue
+
+        reasoning_start = selection_response.find("<reasoning>") + len("<reasoning>")
+        reasoning_end = selection_response.find("</reasoning>")
+        selection_reasoning = selection_response[reasoning_start:reasoning_end].strip()
+
+        if not selected_numbers:
+            logger.info("\n選別結果：")
+            logger.info("保険営業の時事ネタとして適切な記事は見つかりませんでした。")
+            logger.info(f"\n理由：\n{selection_reasoning}")
+            return []
+
+        logger.info("\n選別結果：")
+        logger.info(f"保険営業の時事ネタとして {len(selected_numbers)} 件の記事が選択されました。")
+
+        batch_selected_articles = []
+        for num in selected_numbers:
+            article = next((a for a in numbered_articles if a["number"] == num), None)
+            if article:
+                batch_selected_articles.append({
+                    "title": article["title"],
+                    "url": article["url"]
+                })
+                logger.info(f"\n{article['number']}. {article['title']}")
+                logger.info(f"   URL: {article['url']}")
+
+        logger.info(f"\n選択理由：\n{selection_reasoning}")
+        return batch_selected_articles
+
+    except (json.JSONDecodeError, Exception) as e:
+        logger.error(f"Error processing selection: {str(e)}")
+        logger.error(f"Raw response: {selection_response}")
+        return []
+
+def select_relevant_articles(new_articles: list, batch_size: int = 50) -> list:
+    """
+    新規記事から関連する記事を選別します
+
+    Args:
+        new_articles (list): 新規記事のリスト
+        batch_size (int, optional): バッチサイズ. デフォルトは50
+
+    Returns:
+        list: 選別された記事のリスト
+    """
+    logger = logging.getLogger(__name__)
+    logger.info("Starting article selection process...")
+    all_selected_articles = []
+
+    for batch_start in range(0, len(new_articles), batch_size):
+        batch_end = min(batch_start + batch_size, len(new_articles))
+        batch_articles = new_articles[batch_start:batch_end]
+        
+        logger.info(f"Processing batch {batch_start//batch_size + 1} ({batch_start+1} to {batch_end} of {len(new_articles)} articles)")
+        batch_selected_articles = process_article_batch(batch_articles, batch_start)
+        all_selected_articles.extend(batch_selected_articles)
+
+    return all_selected_articles
+
+def save_new_referenced_articles(selected_articles: list, fa: FirestoreAdapter):
+    """
+    選別された新規記事を参照記事として保存します
+
+    Args:
+        selected_articles (list): 選別された記事のリスト
+        fa (FirestoreAdapter): FirestoreAdapterインスタンス
+    """
+    logger = logging.getLogger(__name__)
+    if not selected_articles:
+        return
+
+    logger.info("過去の参照記事を取得中...")
+    referenced_articles = fa.get_referenced_articles(db)
+    referenced_urls = {article['url'] for article in referenced_articles}
+
+    new_referenced_articles = [
+        article for article in selected_articles
+        if article['url'] not in referenced_urls
+    ]
+
+    if new_referenced_articles:
+        logger.info(f"{len(new_referenced_articles)}件の新規参照記事を保存中...")
+        fa.save_referenced_articles_batch(db, new_referenced_articles)
+        logger.info("新規参照記事の保存が完了しました。")
+    else:
+        logger.info("新規の参照記事はありませんでした。")
+
+def process_article_groups(selected_articles: list) -> dict:
+    """
+    選別された記事から、同一内容の記事をグループ化します
+
+    Args:
+        selected_articles (list): 選別された記事のリスト
+
+    Returns:
+        dict: グループ化された記事の情報
+    """
+    logger = logging.getLogger(__name__)
+    numbered_articles = []
+    article_text = ""
+
+    for i, article in enumerate(selected_articles, 1):
+        numbered_articles.append({
+            "number": i,
+            "title": article["title"],
+            "url": article["url"]
+        })
+        article_text += f"{i}. {article['title']}\n"
+
+    openai = OpenaiAdapter()
+    grouping_prompt = get_article_grouping_prompt()
+    grouping_response = openai.openai_chat(
+        openai_model="gpt-4",
+        prompt=grouping_prompt + "\n\n" + article_text
+    )
+
+    try:
+        reasoning_start = grouping_response.find("<reasoning>") + len("<reasoning>")
+        reasoning_end = grouping_response.find("</reasoning>")
+        grouping_reasoning = grouping_response[reasoning_start:reasoning_end].strip()
+
+        groups_start = grouping_response.find("<grouped_articles>") + len("<grouped_articles>")
+        groups_end = grouping_response.find("</grouped_articles>")
+        groups_str = grouping_response[groups_start:groups_end].strip()
+
+        groups = json.loads(groups_str)
+
+        logger.info("\nグループ化結果：")
+        logger.info(f"\n理由：\n{grouping_reasoning}")
+        
+        # 各グループの記事を表示
+        for group_name, group_info in groups.items():
+            if group_name == "others":
+                logger.info(f"\n【その他の個別記事】:")
+            else:
+                logger.info(f"\n【{group_info['title']}】:")
+            
+            for num in group_info['articles']:
+                article = next((a for a in numbered_articles if a["number"] == num), None)
+                if article:
+                    logger.info(f"- {article['title']}")
+                    logger.info(f"  URL: {article['url']}")
+
+        # グループ化された記事の情報を返す
+        return {
+            "reasoning": grouping_reasoning,
+            "groups": groups,
+            "articles": numbered_articles
+        }
+
+    except (json.JSONDecodeError, Exception) as e:
+        logger.error(f"Error processing groups: {str(e)}")
+        logger.error(f"Raw response: {grouping_response}")
+        return None
+
 def main():
     """メイン処理"""
     setup_logging()
     logger = logging.getLogger(__name__)
 
     try:
-        # スクレイパーとFirestoreAdapterの初期化
+        # 初期化
         yns = YahooNewsScraper()
         fa = FirestoreAdapter()
-        
-        # すべてのカテゴリの記事を取得（結果を保存）
-        logger.info("Starting to scrape Yahoo News categories...")
-        results = yns.scrape_all_categories(save_results=True)
-        
-        # 既存の記事を取得
-        logger.info("Fetching existing articles from Firestore...")
-        existing_articles = fa.get_discovered_articles(db)
-        existing_urls = {article['url'] for article in existing_articles}
-        
-        # 新規記事のフィルタリングと保存
-        logger.info("Filtering and saving new articles...")
-        new_articles = []
-        for category, articles in results.items():
-            for article in articles:
-                # 既存の記事と重複していない場合のみ追加
-                if article['url'] not in existing_urls:
-                    new_articles.append(article)
-                    logger.info(f"Found new article: {article['title']}")
 
-        # 新規記事を一括で保存
+        # 記事収集パイプライン
+        scraped_articles = scrape_news_articles(yns)
+        new_articles = filter_new_articles(scraped_articles, fa)
+
         if new_articles:
             fa.save_discovered_articles_batch(db, new_articles)
             logger.info(f"Saved {len(new_articles)} new articles in batch")
-            
-            # 記事選別のための前処理
-            logger.info("Starting article selection process...")
-            numbered_articles = []
-            article_text = ""
-            
-            for i, article in enumerate(new_articles, 1):
-                numbered_articles.append({
-                    "number": i,
-                    "title": article["title"],
-                    "url": article["url"]
-                })
-                article_text += f"{i}. {article['title']}\n"
-            
-            # OpenAI APIを使用して記事を選別
-            openai = OpenaiAdapter()
-            selection_prompt = get_article_selection_prompt()
-            selection_response = openai.openai_chat(
-                openai_model="gpt-4o",
-                prompt=selection_prompt + "\n\n" + article_text
-            )
-            
-            try:
-                # 選択された記事番号を抽出
-                selection_start = selection_response.find("<selected_articles>") + len("<selected_articles>")
-                selection_end = selection_response.find("</selected_articles>")
-                selected_numbers = json.loads(selection_response[selection_start:selection_end])
-                
-                # 選択理由を抽出
-                reasoning_start = selection_response.find("<reasoning>") + len("<reasoning>")
-                reasoning_end = selection_response.find("</reasoning>")
-                selection_reasoning = selection_response[reasoning_start:reasoning_end].strip()
-                
-                # 選択された記事の有無をチェック
-                if not selected_numbers:
-                    logger.info("\n選別結果：")
-                    logger.info("保険営業の時事ネタとして適切な記事は見つかりませんでした。")
-                    logger.info(f"\n理由：\n{selection_reasoning}")
-                else:
-                    # 選択された記事を表示
-                    logger.info("\n選別結果：")
-                    logger.info(f"保険営業の時事ネタとして {len(selected_numbers)} 件の記事が選択されました。")
-                    
-                    # 選択された記事のリストを作成
-                    selected_articles = []
-                    for num in selected_numbers:
-                        article = next((a for a in numbered_articles if a["number"] == num), None)
-                        if article:
-                            selected_articles.append({
-                                "title": article["title"],
-                                "url": article["url"]
-                            })
-                            logger.info(f"\n{article['number']}. {article['title']}")
-                            logger.info(f"   URL: {article['url']}")
-                    
-                    logger.info(f"\n選択理由：\n{selection_reasoning}")
-                    
-                    # 過去の参照記事を取得
-                    logger.info("過去の参照記事を取得中...")
-                    referenced_articles = fa.get_referenced_articles(db)
-                    referenced_urls = {article['url'] for article in referenced_articles}
-                    
-                    # 新規の参照記事をフィルタリング
-                    new_referenced_articles = [
-                        article for article in selected_articles
-                        if article['url'] not in referenced_urls
-                    ]
-                    
-                    # 新規の参照記事があれば保存
-                    if new_referenced_articles:
-                        logger.info(f"{len(new_referenced_articles)}件の新規参照記事を保存中...")
-                        fa.save_referenced_articles_batch(db, new_referenced_articles)
-                        logger.info("新規参照記事の保存が完了しました。")
-                    else:
-                        logger.info("新規の参照記事はありませんでした。")
-                
-            except json.JSONDecodeError as e:
-                logger.error(f"Error parsing selection response: {str(e)}")
-                logger.error(f"Raw response: {selection_response}")
-            except Exception as e:
-                logger.error(f"Error processing selection: {str(e)}")
-        
-        # 結果の表示
-        # display_results(results)
+
+            selected_articles = select_relevant_articles(new_articles)
+            if selected_articles:
+                # 選別された記事をグループ化
+                grouped_results = process_article_groups(selected_articles)
+                if grouped_results:
+                    # グループ化された記事を保存
+                    save_new_referenced_articles(selected_articles, fa)
 
     except Exception as e:
         logger.error(f"Error occurred: {str(e)}", exc_info=True)
         raise
-
-
-
-# def collect_customer_info():
-#     """顧客情報を収集するための質問を表示する"""
-#     print("\nアシスタント：以下の情報を教えていただけますでしょうか？")
-#     print("・お客様の年齢")
-#     print("・お客様の性別")
-#     print("・ご家族構成（独身・家族）")
-#     print("・お仕事（サラリーマン・自営業、職種）")
-#     print("・お住まいの都道府県")
-    
-#     # ユーザーからの入力を受け取る
-#     customer_info = input("\nユーザー：")
-#     return customer_info
-
-# def main():
-#     load_dotenv()
-#     custom_search_engine_id = os.getenv("GOOGLE_CSE_ID")
-#     # OpenAIアダプターとWebSearchのインスタンスを作成
-#     openai = OpenaiAdapter()
-#     web_search = WebSearch(default_engine="duckduckgo")
-#     # web_search.scraper = WebScraper(verify_ssl=False)  # SSL検証を無効化
-#     fa = FirestoreAdapter(db)
-    
-#     while True:
-#         start_time_total = time.time()
-        
-#         # 顧客情報の収集
-#         customer_input = collect_customer_info()
-        
-#         # 終了コマンドの確認
-#         if customer_input.lower() == 'quit':
-#             print("システムを終了します。")
-#             break
-        
-#         # 顧客情報の整理
-#         start_time = time.time()
-#         analysis_response = openai.openai_chat(
-#             openai_model="gpt-4o",
-#             prompt=get_customer_info_analysis_prompt() + f"\n\n入力情報: {customer_input}"
-#         )
-#         print(f"顧客情報分析処理時間: {time.time() - start_time:.2f}秒")
-        
-#         # 整理された顧客情報の抽出
-#         try:
-#             info_start = analysis_response.find("<customer_info>") + len("<customer_info>")
-#             info_end = analysis_response.find("</customer_info>")
-#             customer_info = json.loads(analysis_response[info_start:info_end])
-            
-#             # 整理された情報の表示
-#             print("\n【整理された顧客情報】")
-#             print(f"年齢：{customer_info['age']}")
-#             print(f"性別：{customer_info['gender']}")
-#             print(f"家族構成：{customer_info['family_status']}")
-#             print(f"職業：{customer_info['occupation']['type']} ({customer_info['occupation']['industry']})")
-#             print(f"居住地：{customer_info['location']}")
-            
-#             # アイスブレイク情報の収集
-#             print("\n【アイスブレイク情報の収集中...】")
-            
-#             # 検索キーワードの生成
-#             start_time = time.time()
-#             search_keywords_prompt = get_search_keywords_prompt()
-#             search_keywords_response = openai.openai_chat(
-#                 openai_model="gpt-4o",
-#                 prompt=search_keywords_prompt + f"\n\n顧客情報: {json.dumps(customer_info, ensure_ascii=False)}"
-#             )
-#             print(f"検索キーワード生成処理時間: {time.time() - start_time:.2f}秒")
-            
-#             try:
-#                 keywords_start = search_keywords_response.find("<search_keywords>") + len("<search_keywords>")
-#                 keywords_end = search_keywords_response.find("</search_keywords>")
-#                 search_keywords = json.loads(search_keywords_response[keywords_start:keywords_end])
-                
-#                 # Web検索の実行
-#                 search_results = {}
-#                 for category, keyword in search_keywords.items():
-#                     # print(f"\n{category}に関する情報を検索中: {keyword}")
-                    
-#                     scrape_options = {
-#                         "save_json": False,
-#                         "save_markdown": False,
-#                         "exclude_links": True,
-#                         "max_depth": 20
-#                     }
-                    
-#                     # Web検索を実行し、Markdown形式でデータを取得
-#                     start_time = time.time()
-#                     search_result = web_search.search_and_standardize(
-#                         keyword,
-#                         scrape_urls=True,
-#                         scrape_options=scrape_options,
-#                         max_results=4
-#                     )
-#                     print(f"Web検索処理時間: {time.time() - start_time:.2f}秒")
-                    
-#                     # 検索結果とスクレイピングデータを整理
-#                     research_content = f"検索キーワード: {keyword}\n\n"
-#                     current_chunk = research_content
-#                     intermediate_summaries = []
-                    
-#                     # スクレイピング結果の確認
-#                     has_valid_content = False
-#                     if search_result.get("scraped_data"):
-#                         for url, data in search_result["scraped_data"].items():
-#                             if data and "markdown_data" in data:
-#                                 has_valid_content = True
-#                                 new_content = f"\n---\nURL: {url}\n{data['markdown_data']}\n"
-#                                 # トークン数を計算
-#                                 if count_tokens(current_chunk + new_content) > 30000:
-#                                     # 現在のチャンクを中間要約
-#                                     intermediate_summary = openai.openai_chat(
-#                                         openai_model="gpt-4o",
-#                                         prompt=get_web_research_summarize_prompt() + f"\n\n{current_chunk}"
-#                                     )
-#                                     intermediate_summaries.append(intermediate_summary)
-#                                     # 新しいチャンクを開始
-#                                     current_chunk = new_content
-#                                 else:
-#                                     current_chunk += new_content
-                    
-#                     if has_valid_content:
-#                         # 最後のチャンクを処理
-#                         if current_chunk:
-#                             intermediate_summary = openai.openai_chat(
-#                                 openai_model="gpt-4o",
-#                                 prompt=get_web_research_summarize_prompt() + f"\n\n{current_chunk}"
-#                             )
-#                             intermediate_summaries.append(intermediate_summary)
-                        
-#                         # すべての中間要約を結合
-#                         summary = "\n\n".join(intermediate_summaries)
-#                         print(f"検索結果整理処理時間: {time.time() - start_time:.2f}秒")
-#                     else:
-#                         summary = "情報の取得に失敗しました。"
-                    
-#                     search_results[category] = summary
-                
-#                 # アイスブレイクの提案生成
-#                 start_time = time.time()
-#                 icebreak_prompt = get_icebreak_suggestion_prompt()
-#                 icebreak_context = {
-#                     "customer_info": customer_info,
-#                     "search_results": search_results
-#                 }
-                
-#                 icebreak_suggestions = openai.openai_chat(
-#                     openai_model="gpt-4o",
-#                     prompt=icebreak_prompt + f"\n\nコンテキスト: {json.dumps(icebreak_context, ensure_ascii=False)}"
-#                 )
-#                 print(f"アイスブレイク提案生成処理時間: {time.time() - start_time:.2f}秒")
-
-#                 # JSONデータの抽出と解析
-#                 try:
-#                     suggestions_start = icebreak_suggestions.find("<icebreak_suggestions>") + len("<icebreak_suggestions>")
-#                     suggestions_end = icebreak_suggestions.find("</icebreak_suggestions>")
-#                     suggestions_data = json.loads(icebreak_suggestions[suggestions_start:suggestions_end])
-
-#                     # 整形された形式で出力
-#                     print("\n【アイスブレイク提案】")
-                    
-#                     for topic, data in suggestions_data["topics"].items():
-#                         topic_names = {
-#                             "weather": "天候に関する話題",
-#                             "local": "地域に関する話題",
-#                             "news": "ニュースに関する話題",
-#                             "seasonal": "季節に関する話題"
-#                         }
-                        
-#                         print(f"\n{topic_names.get(topic, topic)}")
-#                         print("- 切り出し方：")
-#                         print(f"{data['starter']}")
-#                         print("\n- 情報源：")
-#                         print(f"{data['source']}")
-#                         print("\n- 保険への展開：")
-#                         print(f"{data['insurance_bridge']}")
-                    
-#                     print("\n【最適なアプローチ】")
-#                     print(suggestions_data["best_approach"])
-#                     print(f"\n総処理時間: {time.time() - start_time_total:.2f}秒")
-
-#                 except json.JSONDecodeError:
-#                     print("エラー：アイスブレイク提案の解析に失敗しました。")
-#                     print(icebreak_suggestions)  # デバッグ用に元のレスポンスを表示
-            
-#             except json.JSONDecodeError:
-#                 print("エラー：検索キーワードの解析に失敗しました。")
-#             except Exception as e:
-#                 print(f"エラー：検索処理中にエラーが発生しました: {str(e)}")
-            
-#             # 続けて別の顧客情報を入力するか確認
-#             continue_input = input("\n別の顧客情報を入力しますか？ (y/n): ")
-#             if continue_input.lower() != 'y':
-#                 print("システムを終了します。")
-#                 break
-                
-#         except json.JSONDecodeError:
-#             print("エラー：顧客情報の解析に失敗しました。")
-#             print("もう一度入力をお願いします。")
-#             continue
-#         except Exception as e:
-#             print(f"エラー：処理中にエラーが発生しました: {str(e)}")
-#             print("もう一度入力をお願いします。")
-#             continue
 
 if __name__ == "__main__":
     main() 

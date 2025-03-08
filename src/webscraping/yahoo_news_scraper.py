@@ -1,6 +1,6 @@
 from typing import Dict, List, Optional
-from .url_scraper import URLScraper
-from ..config.targets import get_yahoo_news_config, get_scraping_config
+from src.webscraping.url_scraper import URLScraper
+from src.config.targets import get_yahoo_news_config, get_scraping_config
 import logging
 from pathlib import Path
 import json
@@ -121,3 +121,75 @@ class YahooNewsScraper:
                 })
 
         return articles 
+
+    def scrape_article_urls(self, url: str) -> Dict[str, List[Dict[str, str]]]:
+        """
+        ニュース記事ページからメイン記事とピックアップ記事の情報を抽出します
+
+        Args:
+            url (str): 記事ページのURL
+
+        Returns:
+            Dict[str, List[Dict[str, str]]]: {
+                'main_article': [{'title': タイトル, 'url': URL}],
+                'pickup_articles': [{'title': タイトル, 'url': URL}]
+            }
+        """
+        # HTMLの取得
+        result = self.url_scraper.scrape_urls([url], 'html')
+        if not result or not result[0]["success"]:
+            self.logger.error(f"Failed to fetch HTML from {url}")
+            return {'main_article': [], 'pickup_articles': []}
+            
+        html_content = result[0]["elements"]
+        from bs4 import BeautifulSoup
+        
+        soup = BeautifulSoup(html_content, 'html.parser')
+        results = {
+            'main_article': [],
+            'pickup_articles': []
+        }
+        
+        # メイン記事の抽出
+        # 1. metaタグのog:titleとog:urlから記事情報を取得
+        og_title = soup.find('meta', property='og:title')
+        og_url = soup.find('meta', property='og:url')
+        if og_title and og_url:
+            results['main_article'].append({
+                'title': og_title['content'].replace(' - Yahoo!ニュース', ''),
+                'url': og_url['content']
+            })
+            
+        # ピックアップ記事の抽出
+        # 1. 最初のsectionタグを探す
+        # 2. その中の最初のulリストを探す
+        # 3. リスト内のaタグからURLとタイトルを抽出
+        section = soup.find('section')  # 最初のsectionのみ取得
+        if section:
+            ul = section.find('ul')  # 最初のulのみ取得
+            if ul:
+                for link in ul.find_all('a', href=True):
+                    title = link.get_text(strip=True)
+                    url = link['href']
+                    if title and url:
+                        results['pickup_articles'].append({
+                            'title': title,
+                            'url': url
+                        })
+        
+        return results
+
+    def get_article_body(self, url: str) -> Optional[str]:
+        """
+        記事本文ページからbodyの内容を取得します
+
+        Args:
+            url (str): 記事のURL
+
+        Returns:
+            Optional[str]: 記事本文のHTML。取得失敗時はNone
+        """
+        result = self.url_scraper.scrape_urls([url], 'body')
+        if result and result[0]["success"]:
+            return result[0]["elements"]
+        return None 
