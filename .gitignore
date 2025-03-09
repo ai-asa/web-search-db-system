@@ -173,3 +173,4 @@ cython_debug/
 
 # Output folder
 output/
+test_output/

@@ -151,14 +151,24 @@ class YahooNewsScraper:
         }
         
         # メイン記事の抽出
-        # 1. metaタグのog:titleとog:urlから記事情報を取得
-        og_title = soup.find('meta', property='og:title')
-        og_url = soup.find('meta', property='og:url')
-        if og_title and og_url:
-            results['main_article'].append({
-                'title': og_title['content'].replace(' - Yahoo!ニュース', ''),
-                'url': og_url['content']
-            })
+        digest_div = soup.find('div', attrs={'data-ual-view-type': 'digest'})
+        if digest_div:
+            # 最初のaタグを取得
+            main_link = digest_div.find('a', href=True)
+            if main_link:
+                # aタグ内のpタグからタイトルを取得
+                main_title = main_link.find('p')
+                if main_title:
+                    results['main_article'].append({
+                        'title': main_title.get_text(strip=True),
+                        'url': main_link['href']
+                    })
+                else:
+                    self.logger.warning("Main article title (p tag) not found")
+            else:
+                self.logger.warning("Main article link (a tag) not found")
+        else:
+            self.logger.warning("Digest div not found")
             
         # ピックアップ記事の抽出
         # 1. 最初のsectionタグを探す
@@ -179,17 +189,132 @@ class YahooNewsScraper:
         
         return results
 
-    def get_article_body(self, url: str) -> Optional[str]:
+    def scrape_article_contents(self, urls: List[str], save_results: bool = False, output_dir: str = "output") -> Dict[str, Dict[str, str]]:
         """
-        記事本文ページからbodyの内容を取得します
+        指定されたURLの記事タイトルと本文を取得します
 
         Args:
-            url (str): 記事のURL
+            urls (List[str]): スクレイピング対象のURL一覧
+            save_results (bool): 結果をファイルに保存するかどうか
+            output_dir (str): 結果を保存するディレクトリ
 
         Returns:
-            Optional[str]: 記事本文のHTML。取得失敗時はNone
+            Dict[str, Dict[str, str]]: {
+                URL: {
+                    'title': タイトル,
+                    'content': 本文
+                }
+            }
         """
-        result = self.url_scraper.scrape_urls([url], 'body')
-        if result and result[0]["success"]:
-            return result[0]["elements"]
-        return None 
+        from bs4 import BeautifulSoup
+        results = {}
+        selectors = self.scraping_config["article_selectors"]
+
+        for url in urls:
+            self.logger.info(f"Scraping article: {url}")
+            page = 1
+            article_content = []
+            
+            while True:
+                # ページURLの生成
+                page_url = url
+                if page > 1:
+                    page_url += self.scraping_config["page_pattern"].format(page)
+
+                # ページのスクレイピング
+                result = self.url_scraper.scrape_urls([page_url], 'html')
+                if not result or not result[0]["success"]:
+                    break
+
+                soup = BeautifulSoup(result[0]["elements"], 'html.parser')
+                
+                # タイトルの取得（最初のページのみ）
+                if page == 1:
+                    title_elem = soup.select_one(selectors["title"])
+                    if title_elem:
+                        # h1要素から直接テキストを取得
+                        title = title_elem.get_text(strip=True)
+                    else:
+                        title = "タイトルなし"
+                
+                # 本文の取得
+                body_elem = soup.select_one(selectors["body"])
+                if not body_elem:
+                    break
+                
+                # 本文要素内のテキストを取得
+                content = []
+                
+                def extract_text_from_element(element):
+                    """
+                    要素から再帰的にテキストを抽出する補助関数
+                    """
+                    if isinstance(element, str):
+                        text = element.strip()
+                        if text:
+                            return [text]
+                        return []
+                    
+                    # リンク要素は除外
+                    if element.name == 'a':
+                        return []
+                    
+                    # その他の要素の場合、子要素を再帰的に処理
+                    texts = []
+                    for child in element.children:
+                        texts.extend(extract_text_from_element(child))
+                    return texts
+
+                # 本文要素内のすべての子要素を再帰的に処理
+                for element in body_elem.children:
+                    # div要素内の全テキストを取得
+                    if element.name == 'div':
+                        texts = extract_text_from_element(element)
+                        content.extend(texts)
+                    # 直接のテキストノードも処理
+                    elif isinstance(element, str) and element.strip():
+                        content.append(element.strip())
+                
+                if content:
+                    article_content.extend(content)
+                page += 1
+
+            # 結果の保存
+            if article_content:
+                # 空行を除去し、段落間に適切な空行を挿入
+                filtered_content = [para for para in article_content if para.strip()]
+                results[url] = {
+                    'title': title,
+                    'content': "\n\n".join(filtered_content)
+                }
+
+        if save_results:
+            self._save_article_contents(results, output_dir)
+
+        return results
+
+    def _save_article_contents(self, results: Dict[str, Dict[str, str]], output_dir: str):
+        """
+        記事内容のスクレイピング結果を保存します
+
+        Args:
+            results (Dict[str, Dict[str, str]]): 記事内容の辞書
+            output_dir (str): 出力ディレクトリ
+        """
+        from hashlib import md5
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        for url, content in results.items():
+            # URLからファイル名を生成
+            file_name = md5(url.encode()).hexdigest()[:10] + "_article.json"
+            file_path = output_path / file_name
+            
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'url': url,
+                    'title': content['title'],
+                    'content': content['content']
+                }, f, ensure_ascii=False, indent=2)
+            
+            self.logger.info(f"Saved article content from {url} to {file_path}")

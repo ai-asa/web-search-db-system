@@ -21,6 +21,10 @@ YAHOO_NEWS = {
 # スクレイピングの設定
 SCRAPING_CONFIG = {
     "page_pattern": "?page={}",   # ページネーションのパターン
+    "article_selectors": {
+        "title": "#uamods > header > h1",
+        "body": "#uamods > div.article_body.highLightSearchTarget"
+    }
 }
 
 def get_yahoo_news_config():
