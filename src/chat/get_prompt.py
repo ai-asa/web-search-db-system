@@ -822,7 +822,7 @@ def get_article_detail_prompt():
 {{
     "title": "情報記事のタイトル（端的に内容を表現）",
     "content": "詳細な情報記事の本文",
-    "icebreak_usage": "この情報をアイスブレイクとしてどのように活用できるかの具体的な説明"
+    "icebreak_usage": "この情報をアイスブレイクとしてどのような顧客にどのように活用できるかの具体的な説明"
 }}
 </detail_article>
 

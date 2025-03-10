@@ -31,3 +31,10 @@ class OpenaiAdapter:
                 if i == self.retry_limit - 1:
                     return None  # エラー時はNoneを返す
                 continue
+
+    def embedding(self, texts):
+        response = self.client.embeddings.create(
+            model="text-embedding-3-large",
+            input=texts
+        )
+        return [d.embedding for d in response.data]
