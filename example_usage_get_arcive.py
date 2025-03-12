@@ -1,80 +1,83 @@
-from src.chat.openai_adapter import OpenaiAdapter
-from src.chat.get_prompt import (
-    get_customer_info_analysis_prompt,
-    get_icebreak_suggestion_prompt,
-    get_search_keywords_prompt,
-    get_web_research_summarize_prompt,
-    get_article_selection_prompt,
-    get_article_grouping_prompt,
-    get_article_group_analysis_prompt,
-    get_individual_article_analysis_prompt,
-    get_article_content_summarize_prompt,
-    get_article_search_keywords_prompt,
-    get_article_detail_prompt
-)
-from src.websearch.web_search import WebSearch
-from src.tiktoken import count_tokens
+# 標準ライブラリ
 import json
-from dotenv import load_dotenv
+import logging
 import os
 import time
-import logging
-from src.webscraping.yahoo_news_scraper import YahooNewsScraper
-import json
-import firebase_admin
-from firebase_admin import firestore
-from firebase_admin import credentials
-from src.firestore.firestore_adapter import FirestoreAdapter 
 from pathlib import Path
-from src.webscraping.web_scraping import WebScraper
 from typing import List, Optional
+
+# サードパーティライブラリ
+import firebase_admin
+from firebase_admin import credentials, firestore
+from dotenv import load_dotenv
+
+# 自作モジュール
+from src.chat.openai_adapter import OpenaiAdapter
+from src.chat.get_prompt import (
+    get_article_selection_prompt,
+    get_article_grouping_prompt,
+    get_article_content_summarize_prompt,
+    get_article_search_keywords_prompt,
+    get_article_detail_prompt,
+    get_article_similarity_check_prompt,
+    get_article_merge_prompt,
+    get_article_retention_period_prompt,
+    get_initial_article_analysis_prompt,
+    get_relevance_validation_prompt
+)
+from src.websearch.web_search import WebSearch
+from src.tiktoken.token_counter import count_tokens
+from src.webscraping.yahoo_news_scraper import YahooNewsScraper
+from src.firestore.firestore_adapter import FirestoreAdapter
+from src.webscraping.web_scraping import WebScraper
+
+# グローバルインスタンスの初期化
+openai_adapter = OpenaiAdapter()
+web_search = WebSearch()
+yahoo_news_scraper = YahooNewsScraper()
+web_scraper = WebScraper()
+firestore_adapter = FirestoreAdapter()
 
 # 認証情報のパスを設定
 credentials_path = str(Path("secret-key") / f"{os.getenv('CLOUD_FIRESTORE_JSON')}.json")
 cred = credentials.Certificate(credentials_path)
-app = firebase_admin.initialize_app(cred)
+
+# Firebase初期化（既に初期化されていない場合のみ）
+if not firebase_admin._apps:
+    app = firebase_admin.initialize_app(cred)
 db = firestore.client()
 
 
-# 開発対象
+"""処理の詳細
+・Yahooニュースの国内、国際、経済の3トピックの記事名と概要URLを全件取得
+・概要ページから本記事とピックアップ記事のタイトルとURLを全件取得
+・Firestoreの取得済み記事を除外する → 過去に一度でも取得した記事は除外する
+・AIで保険営業に関係しそうな記事の判定
+・選択した記事のタイトルとURLをデータベースに保存 → ここでもデータベースに保存済みの記事は除外する
+・取得した記事を内容によってグループ分け
+# グループ記事について
+・新しい記事を2つだけAIで読み込んで本質情報が含まれているかを判断する
+→ 含まれていない場合、そのグループトピックは除外する
+→ 含まれている場合、以下の処理を行う
+・グループの記事数が5件以下の場合はピックアップ記事を含め、全件を分割読込して、AIで本質情報を抽出する
+→ 5件以上の場合は、ピックアップ記事を除外し、メイン記事全件を分割読込して、AIで本質情報を抽出する
+・本質情報が含まれていないグループは削除する
+# 単体記事について
+・メイント記事のみを読み込んで、AIで本質情報が記事に存在するかを分析する
+→ 存在し、ピックアップ記事がある場合は、メインとサブの両方を読み込んでAIによる本質情報の抽出を行う
+→ 存在し、ピックアップ記事がない場合は、本質情報について検索キーワードをAI生成し、検索結果のスクレイピングで、対象情報を整理する
+・本質情報が存在しない記事は削除する
+・各グループまたは各記事毎に取得した本質情報(extracted_info)と全文情報(combined_content)をAIに渡して、詳細な本質情報とターゲット顧客を生成
+・ターゲット顧客情報についてベクトル埋め込みを行い、データベース上を検索して、類似情報を取得(0.65>あたり)
+・同一の時系列記事がある場合は、新たに追記と古い情報の削除による更新データをAIで生成
+・今回作成された本質情報を、一斉に保存期間をAIに判断させて、データベースに保存
 
-# 保険に関連する可能性のある記事を蓄積する機能を考える
-# アイスブレイク用のニュース記事収集システム
-# ・スクレイピング先のサイトを選定しておく
-# yahoo newsをスクレイピングする → 国内、国際、経済の3トピック
-# ・スクレイピング結果から、ニュース記事(とURL)を選定する→AI使用
-# 詳細
-# ・全ページの記事を取得
-# ・記事のタイトルとURLを取得
-# ・データベースで取得済みの記事を除外する → 過去に一度でも取得した記事は除外する
-# ・AIで関係しそうな記事の選択
-# ・選択した記事のタイトルとURLをデータベースに保存
-# ・記事の選定を行う → 記事の内容被り対策
-# 特定のURLから「・・・記事全文を読む」のURLを取得
-# 同様のページから、関連記事のURLを取得
-
-# グループトピックについて
-# 2つだけ記事を読み込んで、本質情報が含まれているかを判断する
-# 含まれていない場合、そのグループトピックは除外する
-# 含まれている場合、以下の処理を行う
-# 同じグループの記事数が複数ある場合、被るサブトピックは全て排除する
-# →　5件以下の場合はサブトピックを含め、全件を分割読込して、本質情報を抽出する　→　最後に本質情報について十分な情報があるかも判断し、無い場合は検索キーワードの抽出、検索による補完
-# →　5件以上の場合は、サブトピックを除外し、全件を分割読込して、本質情報を抽出する
-# 単体トピックについて
-# →　メイントピックの記事のみを読み込んで、保険営業アイスブレイクに使える時事ネタを得たいという視点における本質情報が記事に存在するかを分析する
-# →　存在し、サブトピックがある場合は、メインとサブの両方を読み込んでAIによる本質情報の抽出を行う。十分な情報があるかどうかも同時に判断し、十分な情報がない場合は、検索キーワードの抽出、検索による補完
-# →　存在し、サブトピックがない場合は、本質情報について検索キーワードをAI生成し、検索結果のスクレイピングで、対象情報を整理する
-# ・各グループまたは各記事毎に取得した本質情報(extracted_info)と全文情報(combined_content)をAIに渡して、詳細な本質情報を生成
-
-# ・情報についてベクトル埋め込みを行い、データベース上を検索して、類似情報を取得(0.7>あたり)
-# ・同一の時系列情報だった場合は、新たに追記と古い情報の削除による更新データをAIで生成
-# ・今回作成された本質情報を、一斉に保存期間をAIに判断させて、データベースに保存
-
-# 使用時
-# ・ユーザーの入力情報を基にベクトル検索
-# ・理由を添えて本質情報を選定
-# ・記事毎にアイスブレイク用のテキストを生成
-
+# 使用方法
+・ユーザーの入力情報をベクトル埋め込み
+・データベース上を検索して、類似情報を取得(0.65>あたり)
+・理由を添えて本質情報を選定
+・記事毎にアイスブレイク用のテキストを生成
+"""
 def setup_logging():
     """ロギングの設定"""
     logging.basicConfig(
@@ -98,34 +101,30 @@ def display_results(results: dict):
         if len(articles) > 5:
             print(f"  ... 他 {len(articles) - 5}件")
 
-def scrape_news_articles(yns: YahooNewsScraper) -> dict:
+def scrape_news_articles() -> dict:
     """
     Yahoo Newsから記事をスクレイピングします
-
-    Args:
-        yns (YahooNewsScraper): YahooNewsScraperインスタンス
 
     Returns:
         dict: カテゴリごとの記事リスト
     """
     logger = logging.getLogger(__name__)
     logger.info("Starting to scrape Yahoo News categories...")
-    return yns.scrape_all_categories(save_results=True)
+    return yahoo_news_scraper.scrape_all_categories(save_results=True)
 
-def filter_new_articles(articles_by_category: dict, fa: FirestoreAdapter) -> list:
+def filter_new_articles(articles_by_category: dict) -> list:
     """
     既存の記事を除外し、新規記事のみをフィルタリングします
 
     Args:
         articles_by_category (dict): カテゴリごとの記事リスト
-        fa (FirestoreAdapter): FirestoreAdapterインスタンス
 
     Returns:
         list: 新規記事のリスト
     """
     logger = logging.getLogger(__name__)
     logger.info("Fetching existing articles from Firestore...")
-    existing_articles = fa.get_discovered_articles(db)
+    existing_articles = firestore_adapter.get_discovered_articles(db)
     existing_urls = {article['url'] for article in existing_articles}
 
     new_articles = []
@@ -160,9 +159,8 @@ def process_article_batch(batch_articles: list, batch_start: int) -> list:
         })
         article_text += f"{i}. {article['title']}\n"
 
-    openai = OpenaiAdapter()
     selection_prompt = get_article_selection_prompt()
-    selection_response = openai.openai_chat(
+    selection_response = openai_adapter.openai_chat(
         openai_model="gpt-4o",
         prompt=selection_prompt + "\n\n" + article_text
     )
@@ -224,7 +222,7 @@ def select_relevant_articles(new_articles: list, batch_size: int = 50) -> list:
         batch_size (int, optional): バッチサイズ. デフォルトは50
 
     Returns:
-        list: 選別された記事のリスト
+        list: 選別された記事のリスト。既存のデータベースに存在しない記事のみを含む
     """
     logger = logging.getLogger(__name__)
     logger.info("Starting article selection process...")
@@ -238,22 +236,31 @@ def select_relevant_articles(new_articles: list, batch_size: int = 50) -> list:
         batch_selected_articles = process_article_batch(batch_articles, batch_start)
         all_selected_articles.extend(batch_selected_articles)
 
-    return all_selected_articles
+    # 選別された記事をデータベースに保存し、新規記事のみを取得
+    if all_selected_articles:
+        logger.info(f"Saving {len(all_selected_articles)} selected articles to referenced articles...")
+        new_referenced_articles = save_new_referenced_articles(all_selected_articles)
+        logger.info(f"Found {len(new_referenced_articles)} new articles that were not in the database.")
+        return new_referenced_articles
 
-def save_new_referenced_articles(selected_articles: list, fa: FirestoreAdapter):
+    return []
+
+def save_new_referenced_articles(selected_articles: list) -> list:
     """
     選別された新規記事を参照記事として保存します
 
     Args:
         selected_articles (list): 選別された記事のリスト
-        fa (FirestoreAdapter): FirestoreAdapterインスタンス
+
+    Returns:
+        list: 新規参照記事のリスト。既存のデータベースに存在しない記事のみを含む
     """
     logger = logging.getLogger(__name__)
     if not selected_articles:
-        return
+        return []
 
     logger.info("過去の参照記事を取得中...")
-    referenced_articles = fa.get_referenced_articles(db)
+    referenced_articles = firestore_adapter.get_referenced_articles(db)
     referenced_urls = {article['url'] for article in referenced_articles}
 
     new_referenced_articles = [
@@ -263,10 +270,12 @@ def save_new_referenced_articles(selected_articles: list, fa: FirestoreAdapter):
 
     if new_referenced_articles:
         logger.info(f"{len(new_referenced_articles)}件の新規参照記事を保存中...")
-        fa.save_referenced_articles_batch(db, new_referenced_articles)
+        firestore_adapter.save_referenced_articles_batch(db, new_referenced_articles)
         logger.info("新規参照記事の保存が完了しました。")
     else:
         logger.info("新規の参照記事はありませんでした。")
+
+    return new_referenced_articles
 
 def process_article_groups(selected_articles: list) -> dict:
     """
@@ -290,9 +299,8 @@ def process_article_groups(selected_articles: list) -> dict:
         })
         article_text += f"{i}. {article['title']}\n"
 
-    openai = OpenaiAdapter()
     grouping_prompt = get_article_grouping_prompt()
-    grouping_response = openai.openai_chat(
+    grouping_response = openai_adapter.openai_chat(
         openai_model="gpt-4o",
         prompt=grouping_prompt + "\n\n" + article_text
     )
@@ -336,13 +344,12 @@ def process_article_groups(selected_articles: list) -> dict:
         logger.error(f"Raw response: {grouping_response}")
         return None
 
-def process_article_urls_and_remove_duplicates(grouped_results: dict, yns: YahooNewsScraper) -> dict:
+def process_article_urls_and_remove_duplicates(grouped_results: dict) -> dict:
     """
     各グループ内の記事のURLを取得し、重複するピックアップ記事を削除します
 
     Args:
         grouped_results (dict): グループ化された記事の情報
-        yns (YahooNewsScraper): YahooNewsScraperインスタンス
 
     Returns:
         dict: 重複を除去した記事グループの情報
@@ -362,7 +369,7 @@ def process_article_urls_and_remove_duplicates(grouped_results: dict, yns: Yahoo
             article = next((a for a in grouped_results["articles"] if a["number"] == num), None)
             if article:
                 # 記事URLからメイン記事とピックアップ記事を取得
-                article_urls = yns.scrape_article_urls(article["url"])
+                article_urls = yahoo_news_scraper.scrape_article_urls(article["url"])
                 
                 # メイン記事の情報を保存
                 if article_urls["main_article"]:
@@ -397,14 +404,12 @@ def process_article_urls_and_remove_duplicates(grouped_results: dict, yns: Yahoo
     
     return grouped_results
 
-def analyze_individual_article(article: dict, yns: YahooNewsScraper, web_scraper: WebScraper, logger: logging.Logger) -> Optional[dict]:
+def analyze_individual_article(article: dict, logger: logging.Logger) -> Optional[dict]:
     """
     個別記事の分析を行います
 
     Args:
         article (dict): 記事情報
-        yns (YahooNewsScraper): YahooNewsScraperインスタンス
-        web_scraper (WebScraper): WebScraperインスタンス
         logger (logging.Logger): ロガーインスタンス
 
     Returns:
@@ -413,9 +418,11 @@ def analyze_individual_article(article: dict, yns: YahooNewsScraper, web_scraper
     url = article["main_article"]["url"]
     logger.info(f"記事のスクレイピング: {article['main_article']['title']}")
     
+    article_content = None  # 初期値を設定
+    
     # URLに基づいて適切なスクレイパーを使用
     if "news.yahoo.co.jp" in url:
-        contents = yns.scrape_article_contents([url])
+        contents = yahoo_news_scraper.scrape_article_contents([url])
         if contents and url in contents:
             article_content = contents[url]
     else:
@@ -430,12 +437,12 @@ def analyze_individual_article(article: dict, yns: YahooNewsScraper, web_scraper
     if article_content:
         # 記事本文を保存
         article["main_article"]["content"] = article_content["content"]
-        
+
         analysis_result = analyze_individual_article_content(article_content, logger)
         if analysis_result:
             if analysis_result["has_essential_info"]:
-                article["analysis"] = analysis_result
                 logger.info("分析結果: 本質情報あり")
+                logger.info(f"ターゲット顧客: {analysis_result['target_customers']}")
                 logger.info(f"本質情報: {analysis_result['extracted_info']}")
                 logger.info(f"理由: {analysis_result['reasoning']}")
                 return article
@@ -458,35 +465,132 @@ def analyze_individual_article_content(article_content: dict, logger: logging.Lo
     Returns:
         Optional[dict]: 分析結果。エラー時はNone
     """
+    if not article_content:
+        logger.error("記事内容が空です")
+        return None
+
     # 分析用のテキストを準備
-    analysis_text = f"タイトル: {article_content['title']}\n"
-    analysis_text += f"本文:\n{article_content['content']}"
-    
-    # AIによる分析
+    analysis_text = ""
     try:
+        title = article_content.get("title", "タイトルなし")
+        content_text = article_content.get("content", "")
+        analysis_text += f"\n記事:\n"
+        analysis_text += f"タイトル: {title}\n"
+        analysis_text += f"本文:\n{content_text}\n"
+        
+        # 第1段階：初期分析
         openai = OpenaiAdapter()
-        analysis_prompt = get_individual_article_analysis_prompt()
-        analysis_response = openai.openai_chat(
+        initial_prompt = get_initial_article_analysis_prompt()
+        initial_response = openai.openai_chat(
             openai_model="gpt-4o",
-            prompt=analysis_prompt + "\n\n" + analysis_text
+            prompt=initial_prompt + "\n\n" + analysis_text
         )
         
+        if not initial_response:
+            logger.error("AIからの初期分析の応答が空です")
+            return None
+
         # 分析結果の解析
-        analysis_start = analysis_response.find("<analysis>") + len("<analysis>")
-        analysis_end = analysis_response.find("</analysis>")
-        return json.loads(analysis_response[analysis_start:analysis_end].strip())
+        initial_result = extract_tagged_json(initial_response, "analysis", logger)
+        if not initial_result:
+            logger.error("初期分析結果の解析に失敗しました")
+            return None
+
+        # 必要なキーの存在確認
+        conversation_starter = initial_result.get("conversation_starter", {})
+        insurance_relevance = initial_result.get("insurance_relevance", {})
+        
+        # 第1段階：会話の導入と保険との関連性の確認
+        if not (conversation_starter.get("is_appropriate", False) and insurance_relevance.get("is_relevant", False)):
+            logger.info("初期分析: 会話の導入または保険との関連性が不適切と判断されました")
+            reasons = []
+            if not conversation_starter.get("is_appropriate", False):
+                reasons.append(f"会話の導入として不適切: {conversation_starter.get('reasoning', '理由不明')}")
+            if not insurance_relevance.get("is_relevant", False):
+                reasons.append(f"保険との関連性が不適切: {insurance_relevance.get('reasoning', '理由不明')}")
+            return {
+                "has_essential_info": False,
+                "reasoning": " / ".join(reasons)
+            }
+
+        # 第2段階：保険との関連性の再検証
+        validation_prompt = get_relevance_validation_prompt().format(
+            extracted_info=initial_result.get("extracted_info", ""),
+            relevance_reasoning=insurance_relevance.get("reasoning", "")
+        )
+        
+        validation_response = openai.openai_chat(
+            openai_model="gpt-4o",
+            prompt=validation_prompt
+        )
+        
+        if not validation_response:
+            logger.error("AIからの検証応答が空です")
+            return None
+
+        # 検証結果の解析
+        validation_result = extract_tagged_json(validation_response, "validation", logger)
+        if not validation_result:
+            logger.error("検証結果の解析に失敗しました")
+            return None
+
+        if validation_result.get("is_valid", False):
+            logger.info("検証結果: 保険商品との関連性が確認されました")
+            return {
+                "extracted_info": initial_result.get("extracted_info", ""),
+                "target_customers": validation_result.get("target_customers", ""),
+                "reasoning": validation_result.get("reasoning", ""),
+                "has_essential_info": True
+            }
+        else:
+            logger.info("検証結果: 保険商品との関連性が否定されました")
+            return {
+                "has_essential_info": False,
+                "reasoning": validation_result.get("reasoning", "検証失敗")
+            }
+            
     except Exception as e:
         logger.error(f"分析処理でエラーが発生しました: {str(e)}")
         return None
 
-def analyze_others_group(group_info: dict, yns: YahooNewsScraper, web_scraper: WebScraper, logger: logging.Logger) -> dict:
+def extract_tagged_json(response: str, tag: str, logger: logging.Logger) -> Optional[dict]:
+    """
+    タグで囲まれたJSON文字列を抽出し、辞書に変換します
+
+    Args:
+        response (str): レスポンス文字列
+        tag (str): 抽出するタグ名
+        logger (logging.Logger): ロガーインスタンス
+
+    Returns:
+        Optional[dict]: 抽出された辞書。失敗時はNone
+    """
+    try:
+        start_tag = f"<{tag}>"
+        end_tag = f"</{tag}>"
+        start_idx = response.find(start_tag)
+        end_idx = response.find(end_tag)
+        
+        if start_idx < 0 or end_idx < 0:
+            logger.error(f"{tag}タグが見つかりませんでした")
+            return None
+            
+        json_str = response[start_idx + len(start_tag):end_idx].strip()
+        return json.loads(json_str)
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON解析エラー: {str(e)}")
+        return None
+    except Exception as e:
+        logger.error(f"予期せぬエラー: {str(e)}")
+        return None
+
+def analyze_others_group(group_info: dict, logger: logging.Logger) -> dict:
     """
     その他グループの記事を分析します
 
     Args:
         group_info (dict): その他グループの情報
-        yns (YahooNewsScraper): YahooNewsScraperインスタンス
-        web_scraper (WebScraper): WebScraperインスタンス
         logger (logging.Logger): ロガーインスタンス
 
     Returns:
@@ -496,35 +600,46 @@ def analyze_others_group(group_info: dict, yns: YahooNewsScraper, web_scraper: W
     analyzed_articles = []
     
     for article in group_info["processed_articles"]:
-        analyzed_article = analyze_individual_article(article, yns, web_scraper, logger)
+        analyzed_article = analyze_individual_article(article, logger)
         if analyzed_article:
             analyzed_articles.append(analyzed_article)
     
     group_info["processed_articles"] = analyzed_articles
     return group_info
 
-def analyze_article_group(group_name: str, group_info: dict, yns: YahooNewsScraper, web_scraper: WebScraper, logger: logging.Logger) -> Optional[dict]:
+def analyze_article_group(group_name: str, group_info: dict, logger: logging.Logger) -> Optional[dict]:
     """
     記事グループの分析を行います
 
     Args:
         group_name (str): グループ名
         group_info (dict): グループ情報
-        yns (YahooNewsScraper): YahooNewsScraperインスタンス
-        web_scraper (WebScraper): WebScraperインスタンス
         logger (logging.Logger): ロガーインスタンス
 
     Returns:
-        Optional[dict]: 分析結果を含むグループ情報。本質情報がない場合はNone
+        Optional[dict]: 分析結果を含むグループ情報。
+                       othersグループの場合は有効な記事が1つでもあればその記事群を含むグループ情報、
+                       それ以外のグループの場合は本質情報があれば記事群を含むグループ情報。
+                       どちらの場合も条件を満たさない場合はNone。
     """
     # その他グループは個別に分析
     if group_name == "others":
-        return analyze_others_group(group_info, yns, web_scraper, logger)
+        analysis_result = analyze_others_group(group_info, logger)
+        try:
+            # analyze_others_groupで既に無効な記事は除外されているので、
+            # 記事が存在するかどうかだけを確認
+            if analysis_result.get("processed_articles", []):
+                return analysis_result
+            return None
+        except Exception as e:
+            logger.error(f"その他グループの分析中にエラーが発生: {str(e)}")
+            return None
 
+    # 以下、通常グループの処理
     logger.info(f"\n【{group_info['title']}】の分析を開始")
     
     # 最新の2件の記事を取得
-    latest_articles = group_info["processed_articles"][:2]
+    latest_articles = group_info.get("processed_articles", [])[:2]
     article_contents = []
     
     for article in latest_articles:
@@ -533,7 +648,7 @@ def analyze_article_group(group_name: str, group_info: dict, yns: YahooNewsScrap
         
         # URLに基づいて適切なスクレイパーを使用
         if "news.yahoo.co.jp" in url:
-            contents = yns.scrape_article_contents([url])
+            contents = yahoo_news_scraper.scrape_article_contents([url])
             if contents and url in contents:
                 article_contents.append(contents[url])
         else:
@@ -551,6 +666,7 @@ def analyze_article_group(group_name: str, group_info: dict, yns: YahooNewsScrap
             if analysis_result["has_essential_info"]:
                 group_info["analysis"] = analysis_result
                 logger.info("分析結果: 本質情報あり")
+                logger.info(f"ターゲット顧客: {analysis_result['target_customers']}")
                 logger.info(f"本質情報: {analysis_result['extracted_info']}")
                 logger.info(f"理由: {analysis_result['reasoning']}")
                 return group_info
@@ -573,50 +689,107 @@ def analyze_article_contents(article_contents: List[dict], logger: logging.Logge
     Returns:
         Optional[dict]: 分析結果。エラー時はNone
     """
+    if not article_contents:
+        logger.error("記事内容が空です")
+        return None
+
     # 分析用のテキストを準備
     analysis_text = ""
-    for i, content in enumerate(article_contents, 1):
-        analysis_text += f"\n記事{i}:\n"
-        analysis_text += f"タイトル: {content['title']}\n"
-        analysis_text += f"本文:\n{content['content']}\n"
-    
-    # AIによる分析
     try:
+        for i, content in enumerate(article_contents, 1):
+            title = content.get("title", "タイトルなし")
+            content_text = content.get("content", "")
+            analysis_text += f"\n記事{i}:\n"
+            analysis_text += f"タイトル: {title}\n"
+            analysis_text += f"本文:\n{content_text}\n"
+        
+        # 第1段階：初期分析
         openai = OpenaiAdapter()
-        analysis_prompt = get_article_group_analysis_prompt()
-        analysis_response = openai.openai_chat(
+        initial_prompt = get_initial_article_analysis_prompt()
+        initial_response = openai.openai_chat(
             openai_model="gpt-4o",
-            prompt=analysis_prompt + "\n\n" + analysis_text
+            prompt=initial_prompt + "\n\n" + analysis_text
         )
         
+        if not initial_response:
+            logger.error("AIからの初期分析の応答が空です")
+            return None
+
         # 分析結果の解析
-        analysis_start = analysis_response.find("<analysis>") + len("<analysis>")
-        analysis_end = analysis_response.find("</analysis>")
-        return json.loads(analysis_response[analysis_start:analysis_end].strip())
+        initial_result = extract_tagged_json(initial_response, "analysis", logger)
+        if not initial_result:
+            logger.error("初期分析結果の解析に失敗しました")
+            return None
+
+        # 必要なキーの存在確認
+        conversation_starter = initial_result.get("conversation_starter", {})
+        insurance_relevance = initial_result.get("insurance_relevance", {})
+        
+        if not (conversation_starter.get("is_appropriate", False) and insurance_relevance.get("is_relevant", False)):
+            logger.info("初期分析: 会話の導入または保険との関連性が不適切と判断されました")
+            reasons = []
+            if not conversation_starter.get("is_appropriate", False):
+                reasons.append(f"会話の導入として不適切: {conversation_starter.get('reasoning', '理由不明')}")
+            if not insurance_relevance.get("is_relevant", False):
+                reasons.append(f"保険との関連性が不適切: {insurance_relevance.get('reasoning', '理由不明')}")
+            return {
+                "has_essential_info": False,
+                "reasoning": " / ".join(reasons)
+            }
+
+        # 第2段階：関連性の検証
+        validation_prompt = get_relevance_validation_prompt().format(
+            extracted_info=initial_result.get("extracted_info", ""),
+            relevance_reasoning=insurance_relevance.get("reasoning", "")
+        )
+        
+        validation_response = openai.openai_chat(
+            openai_model="gpt-4o",
+            prompt=validation_prompt
+        )
+        
+        if not validation_response:
+            logger.error("AIからの検証応答が空です")
+            return None
+
+        # 検証結果の解析
+        validation_result = extract_tagged_json(validation_response, "validation", logger)
+        if not validation_result:
+            logger.error("検証結果の解析に失敗しました")
+            return None
+
+        if validation_result.get("is_valid", False):
+            logger.info("検証結果: 保険商品との関連性が確認されました")
+            return {
+                "extracted_info": initial_result.get("extracted_info", ""),
+                "target_customers": validation_result.get("target_customers", ""),
+                "reasoning": validation_result.get("reasoning", ""),
+                "has_essential_info": True
+            }
+        else:
+            logger.info("検証結果: 保険商品との関連性が否定されました")
+            return {
+                "has_essential_info": False,
+                "reasoning": validation_result.get("reasoning", "検証失敗")
+            }
+            
     except Exception as e:
         logger.error(f"分析処理でエラーが発生しました: {str(e)}")
         return None
 
-def process_group_article_contents(group_info: dict, yns: YahooNewsScraper, web_scraper: WebScraper, logger: logging.Logger) -> str:
+def process_group_article_contents(group_info: dict, logger: logging.Logger) -> str:
     """
     グループ内の記事内容を処理し、必要に応じて要約を行います
 
     Args:
         group_info (dict): グループ情報
-        yns (YahooNewsScraper): YahooNewsScraperインスタンス
-        web_scraper (WebScraper): WebScraperインスタンス
         logger (logging.Logger): ロガーインスタンス
 
     Returns:
         str: 処理された記事内容
     """
-    from src.tiktoken.token_counter import count_tokens
-    from src.chat.get_prompt import get_article_content_summarize_prompt
-    from src.chat.openai_adapter import OpenaiAdapter
-
     combined_content = ""
     current_token_count = 0
-    openai = OpenaiAdapter()
 
     # メイン記事の数を確認
     main_articles_count = len(group_info["processed_articles"])
@@ -635,7 +808,7 @@ def process_group_article_contents(group_info: dict, yns: YahooNewsScraper, web_
             # URLに基づいて適切なスクレイパーを使用
             article_content = ""
             if "news.yahoo.co.jp" in url:
-                contents = yns.scrape_article_contents([url])
+                contents = yahoo_news_scraper.scrape_article_contents([url])
                 if contents and url in contents:
                     article_content = contents[url]["content"]
             else:
@@ -654,7 +827,7 @@ def process_group_article_contents(group_info: dict, yns: YahooNewsScraper, web_
                     
                     # 要約の実行
                     summarize_prompt = get_article_content_summarize_prompt()
-                    summary_response = openai.openai_chat(
+                    summary_response = openai_adapter.openai_chat(
                         openai_model="gpt-4o",
                         prompt=summarize_prompt + "\n\n" + combined_content
                     )
@@ -672,27 +845,19 @@ def process_group_article_contents(group_info: dict, yns: YahooNewsScraper, web_
 
     return combined_content
 
-def process_others_article_contents(article: dict, yns: YahooNewsScraper, web_scraper: WebScraper, logger: logging.Logger) -> str:
+def process_others_article_contents(article: dict, logger: logging.Logger) -> str:
     """
     othersグループの個別記事の内容を処理し、必要に応じて要約を行います
 
     Args:
         article (dict): 記事情報
-        yns (YahooNewsScraper): YahooNewsScraperインスタンス
-        web_scraper (WebScraper): WebScraperインスタンス
         logger (logging.Logger): ロガーインスタンス
 
     Returns:
         str: 処理された記事内容
     """
-    from src.tiktoken.token_counter import count_tokens
-    from src.chat.get_prompt import get_article_content_summarize_prompt, get_article_search_keywords_prompt
-    from src.chat.openai_adapter import OpenaiAdapter
-    from src.websearch.web_search import WebSearch
-
     combined_content = ""
     current_token_count = 0
-    openai = OpenaiAdapter()
     
     # メイン記事の処理
     main_article = article["main_article"]
@@ -719,7 +884,7 @@ def process_others_article_contents(article: dict, yns: YahooNewsScraper, web_sc
         extracted_info = article["analysis"]["extracted_info"]
         search_prompt = get_article_search_keywords_prompt().format(extracted_info=extracted_info)
         
-        search_response = openai.openai_chat(
+        search_response = openai_adapter.openai_chat(
             openai_model="gpt-4o",
             prompt=search_prompt
         )
@@ -732,14 +897,12 @@ def process_others_article_contents(article: dict, yns: YahooNewsScraper, web_sc
             if start_idx >= 0 and end_idx >= 0:
                 keywords_str = search_response[start_idx:end_idx].strip()
                 try:
-                    import json
                     keywords = json.loads(keywords_str)
                 except Exception as e:
                     logger.error(f"検索キーワードのJSONパースに失敗しました: {e}")
         
         # 検索キーワードを使用してウェブ検索
         if keywords:
-            web_search = WebSearch()
             for keyword in keywords[:2]:  # 最大2つのキーワードで検索
                 logger.info(f"検索キーワード: {keyword}")
                 search_results = web_search.search_and_standardize(
@@ -755,7 +918,7 @@ def process_others_article_contents(article: dict, yns: YahooNewsScraper, web_sc
                             "url": result["link"],
                             "snippet": result.get("snippet", "")
                         })
-    
+
     # ピックアップ記事のスクレイピングと処理
     if pickup_articles:
         logger.info(f"ピックアップ記事数: {len(pickup_articles)}")
@@ -766,7 +929,7 @@ def process_others_article_contents(article: dict, yns: YahooNewsScraper, web_sc
             # ピックアップ記事のコンテンツを取得
             pickup_content = ""
             if "news.yahoo.co.jp" in pickup_url:
-                contents = yns.scrape_article_contents([pickup_url])
+                contents = yahoo_news_scraper.scrape_article_contents([pickup_url])
                 if contents and pickup_url in contents:
                     pickup_content = contents[pickup_url]["content"]
             else:
@@ -785,7 +948,7 @@ def process_others_article_contents(article: dict, yns: YahooNewsScraper, web_sc
                     
                     # 要約の実行
                     summarize_prompt = get_article_content_summarize_prompt()
-                    summary_response = openai.openai_chat(
+                    summary_response = openai_adapter.openai_chat(
                         openai_model="gpt-4o",
                         prompt=summarize_prompt + "\n\n" + combined_content
                     )
@@ -803,93 +966,203 @@ def process_others_article_contents(article: dict, yns: YahooNewsScraper, web_sc
     
     return combined_content
 
-def generate_detail_article(combined_content: str, extracted_info: str, openai: OpenaiAdapter, logger: logging.Logger) -> dict:
+def process_similar_articles(detail_article: dict, logger: logging.Logger) -> dict:
     """
-    記事内容から詳細な情報記事を生成します
+    類似記事の処理を行い、必要に応じて記事を結合します。
 
     Args:
-        combined_content (str): 記事の結合内容
-        extracted_info (str): 抽出された本質的な情報
-        openai (OpenaiAdapter): OpenAIアダプターインスタンス
+        detail_article (dict): 処理対象の記事情報
         logger (logging.Logger): ロガーインスタンス
 
     Returns:
-        dict: 生成された詳細情報記事
+        dict: 処理後の記事情報
     """
     try:
-        # 入力値の検証
-        if not combined_content or not extracted_info:
-            logger.error("記事内容または抽出情報が空です")
-            return None
+        # ベクトル表現の取得
+        embedding = openai_adapter.embedding([detail_article['target_customers']])[0]
+        detail_article['embedding'] = embedding
 
-        # プロンプトの準備
-        detail_prompt = get_article_detail_prompt().format(
-            extracted_info=extracted_info,
-            combined_content=combined_content
-        )
+        # 類似度検索の実行（類似度付きで結果が返される）
+        similar_articles = firestore_adapter.get_valid_essential_info(db, query_vector=embedding)
         
-        # AIによる詳細情報記事の生成
-        detail_response = openai.openai_chat(
-            openai_model="gpt-4o",
-            prompt=detail_prompt
-        )
+        # 類似度0.7以上の記事を処理
+        articles_to_merge = []
+        articles_to_delete = []
         
-        # 生成結果の解析
-        if not detail_response:
-            logger.error("AIからの応答が空です")
-            return None
-
-        # タグの位置を特定
-        detail_start = detail_response.find("<detail_article>")
-        detail_end = detail_response.find("</detail_article>")
-        
-        if detail_start < 0 or detail_end < 0:
-            logger.error("AIの応答から必要なタグが見つかりませんでした")
-            return None
+        for article in similar_articles:
+            # get_valid_essential_infoから返される類似度を使用
+            similarity = article.get('similarity', 0)
             
-        # タグの中身を抽出
-        detail_json = detail_response[detail_start + len("<detail_article>"):detail_end].strip()
-        
-        try:
-            import json
-            detail_article = json.loads(detail_json)
-            
-            # 必要なキーの存在確認
-            required_keys = ["title", "content", "icebreak_usage"]
-            if not all(key in detail_article for key in required_keys):
-                logger.error("生成された記事に必要な情報が含まれていません")
-                return None
+            if similarity >= 0.65:
+                # 類似性チェック用のプロンプト生成
+                check_prompt = get_article_similarity_check_prompt().format(
+                    title1=detail_article['title'],
+                    content1=detail_article['content'],
+                    title2=article['title'],
+                    content2=article['content']
+                )
                 
-            logger.info("詳細情報記事の生成が完了しました")
-            return detail_article
+                # AIによる類似性判断
+                check_response = openai_adapter.openai_chat(
+                    openai_model="gpt-4o",
+                    prompt=check_prompt
+                )
+                
+                if check_response:
+                    check_start = check_response.find("<similarity_check>")
+                    check_end = check_response.find("</similarity_check>")
+                    
+                    if check_start >= 0 and check_end >= 0:
+                        check_json = check_response[check_start + len("<similarity_check>"):check_end].strip()
+                        check_result = json.loads(check_json)
+                        
+                        if check_result.get('is_similar'):
+                            articles_to_merge.append(article)
+                            articles_to_delete.append({
+                                'title': article['title'],
+                                'content': article['content']
+                            })
+        
+        # 類似記事がある場合は結合処理を実行
+        if articles_to_merge:
+            # 結合用の記事情報を準備
+            articles_info = [
+                {
+                    'title': detail_article['title'],
+                    'content': detail_article['content'],
+                    "target_customers": detail_article['target_customers'],
+                    'usage_example': detail_article['usage_example']
+                }
+            ]
+            articles_info.extend([{
+                'title': article['title'],
+                'content': article['content'],
+                'target_customers': article['target_customers'],
+                'usage_example': article['usage_example']
+            } for article in articles_to_merge])
             
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON解析エラー: {str(e)}")
-            return None
+            # 結合用のプロンプト生成
+            merge_prompt = get_article_merge_prompt().format(
+                articles_info=json.dumps(articles_info, ensure_ascii=False, indent=2)
+            )
             
+            # AIによる記事結合
+            merge_response = openai_adapter.openai_chat(
+                openai_model="gpt-4o",
+                prompt=merge_prompt
+            )
+            
+            if merge_response:
+                merge_start = merge_response.find("<merged_article>")
+                merge_end = merge_response.find("</merged_article>")
+                
+                if merge_start >= 0 and merge_end >= 0:
+                    merge_json = merge_response[merge_start + len("<merged_article>"):merge_end].strip()
+                    merged_article = json.loads(merge_json)
+                    
+                    # 新しいベクトル表現の取得
+                    new_embedding = openai_adapter.embedding([merged_article['usage_example']])[0]
+                    
+                    # 結合結果で元の記事情報を更新
+                    detail_article.update({
+                        'title': merged_article['title'],
+                        'content': merged_article['content'],
+                        'usage_example': merged_article['usage_example'],
+                        'target_customers': merged_article['target_customers'],
+                        'embedding': new_embedding
+                    })
+                    
+                    # 古い記事の削除
+                    firestore_adapter.delete_essential_info_batch(db, articles_to_delete)
+                    
+                    logger.info(f"記事を結合しました: {detail_article['title']}")
+    
     except Exception as e:
-        logger.error(f"詳細情報記事の生成中にエラーが発生しました: {str(e)}")
+        logger.error(f"類似記事の処理中にエラーが発生しました: {e}")
+    
+    return detail_article
+
+def generate_detail_article(combined_content: str, extracted_info: str, logger: logging.Logger) -> dict:
+    """
+    記事の詳細情報を生成し、類似記事との結合処理を行います。
+
+    Args:
+        combined_content (str): 結合された記事内容
+        extracted_info (str): 抽出された本質的な情報
+        logger (logging.Logger): ロガーインスタンス
+
+    Returns:
+        dict: 生成された詳細記事情報
+    """
+    if not combined_content or not extracted_info:
+        logger.error("記事内容または抽出情報が空です")
         return None
 
-def analyze_article_groups(processed_results: dict, yns: YahooNewsScraper, logger: logging.Logger) -> dict:
+    # プロンプトの準備
+    detail_prompt = get_article_detail_prompt().format(
+        extracted_info=extracted_info,
+        combined_content=combined_content
+    )
+    
+    # AIによる詳細情報記事の生成
+    detail_response = openai_adapter.openai_chat(
+        openai_model="gpt-4o",
+        prompt=detail_prompt
+    )
+    
+    # 生成結果の解析
+    if not detail_response:
+        logger.error("AIからの応答が空です")
+        return None
+
+    # タグの位置を特定
+    detail_start = detail_response.find("<detail_article>")
+    detail_end = detail_response.find("</detail_article>")
+    
+    if detail_start < 0 or detail_end < 0:
+        logger.error("AIの応答から必要なタグが見つかりませんでした")
+        return None
+        
+    # タグの中身を抽出
+    detail_json = detail_response[detail_start + len("<detail_article>"):detail_end].strip()
+    
+    try:
+        detail_article = json.loads(detail_json)
+        
+        # 必要なキーの存在確認
+        required_keys = ["title", "content", "target_customers", "usage_example"]
+        if not all(key in detail_article for key in required_keys):
+            logger.error("生成された記事に必要な情報が含まれていません")
+            return None
+        
+        # 類似記事の処理
+        detail_article = process_similar_articles(detail_article, logger)
+            
+        return detail_article
+            
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON解析エラー: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"予期せぬエラー: {e}")
+        return None
+
+def analyze_article_groups(processed_results: dict, logger: logging.Logger) -> dict:
     """
     全ての記事グループを分析します
 
     Args:
         processed_results (dict): 処理済みの記事グループ情報
-        yns (YahooNewsScraper): YahooNewsScraperインスタンス
         logger (logging.Logger): ロガーインスタンス
 
     Returns:
         dict: 分析後の記事グループ情報
     """
     logger.info("\n記事グループの分析を開始します...")
-    web_scraper = WebScraper()
     analyzed_groups = {}
-    openai = OpenaiAdapter()
     
     for group_name, group_info in processed_results["groups"].items():
-        analyzed_group = analyze_article_group(group_name, group_info, yns, web_scraper, logger)
+        analyzed_group = analyze_article_group(group_name, group_info, logger)
         if analyzed_group:
             # グループ名に応じて適切な処理を実行
             if group_name == "others":
@@ -897,7 +1170,7 @@ def analyze_article_groups(processed_results: dict, yns: YahooNewsScraper, logge
                 # othersグループの各記事を個別に処理
                 for i, article in enumerate(analyzed_group["processed_articles"]):
                     logger.info(f"\n個別記事 {i+1}/{len(analyzed_group['processed_articles'])} の処理を開始")
-                    combined_content = process_others_article_contents(article, yns, web_scraper, logger)
+                    combined_content = process_others_article_contents(article, logger)
                     article["combined_content"] = combined_content
                     
                     # 詳細情報記事の生成
@@ -905,14 +1178,13 @@ def analyze_article_groups(processed_results: dict, yns: YahooNewsScraper, logge
                         detail_article = generate_detail_article(
                             combined_content,
                             article["analysis"]["extracted_info"],
-                            openai,
                             logger
                         )
                         if detail_article:
                             article["detail_article"] = detail_article
             else:
                 logger.info(f"\n【{group_info['title']}】の記事内容の処理を開始")
-                combined_content = process_group_article_contents(analyzed_group, yns, web_scraper, logger)
+                combined_content = process_group_article_contents(analyzed_group, logger)
                 analyzed_group["combined_content"] = combined_content
                 
                 # グループの詳細情報記事の生成
@@ -920,7 +1192,6 @@ def analyze_article_groups(processed_results: dict, yns: YahooNewsScraper, logge
                     detail_article = generate_detail_article(
                         combined_content,
                         analyzed_group["analysis"]["extracted_info"],
-                        openai,
                         logger
                     )
                     if detail_article:
@@ -931,6 +1202,92 @@ def analyze_article_groups(processed_results: dict, yns: YahooNewsScraper, logge
     processed_results["groups"] = analyzed_groups
     return processed_results
 
+def determine_retention_periods(articles: list, logger: logging.Logger) -> list:
+    """
+    記事の保持期間を判断します
+
+    Args:
+        articles (list): 判断対象の記事リスト
+        logger (logging.Logger): ロガーインスタンス
+
+    Returns:
+        list: 保持期間が設定された記事リスト
+    """
+    logger.info("\n記事の保持期間の判断を開始します...")
+    
+    # 記事を5個ずつのバッチに分割
+    batch_size = 5
+    for i in range(0, len(articles), batch_size):
+        batch = articles[i:i + batch_size]
+        
+        # 判断用のテキストを準備
+        article_text = ""
+        for j, article in enumerate(batch, 1):
+            article_text += f"{j}. {article['title']}\n"
+        
+        # AIによる判断
+        retention_prompt = get_article_retention_period_prompt()
+        retention_response = openai_adapter.openai_chat(
+            openai_model="gpt-4o",
+            prompt=retention_prompt + "\n\n" + article_text
+        )
+        
+        try:
+            # 判断結果の解析
+            periods_start = retention_response.find("<retention_periods>") + len("<retention_periods>")
+            periods_end = retention_response.find("</retention_periods>")
+            periods_json = retention_response[periods_start:periods_end].strip()
+            periods_data = json.loads(periods_json)
+            
+            # 各記事に保持期間を設定
+            for period_info in periods_data["article_periods"]:
+                article_idx = period_info["number"] - 1
+                if 0 <= article_idx < len(batch):
+                    batch[article_idx]["retention_period_days"] = period_info["days"]
+                    logger.info(f"記事「{batch[article_idx]['title']}」の保持期間: {period_info['days']}日")
+                    logger.info(f"理由: {period_info['reasoning']}")
+        
+        except Exception as e:
+            logger.error(f"保持期間の判断中にエラーが発生しました: {e}")
+            # エラーが発生した場合はデフォルトの保持期間（7日）を設定
+            for article in batch:
+                article["retention_period_days"] = 7
+    
+    return articles
+
+def process_and_save_articles(analyzed_results: dict, logger: logging.Logger):
+    """
+    記事の処理と保存を行います
+
+    Args:
+        analyzed_results (dict): 分析済みの記事グループ情報
+        logger (logging.Logger): ロガーインスタンス
+    """
+    logger.info("\n記事の処理と保存を開始します...")
+    
+    # 保存対象の記事を収集
+    articles_to_save = []
+    
+    for group_name, group_info in analyzed_results["groups"].items():
+        if group_name == "others":
+            # othersグループは記事ごとに処理
+            for article in group_info["processed_articles"]:
+                if "detail_article" in article:
+                    articles_to_save.append(article["detail_article"])
+        else:
+            # 通常のグループは1つの記事として処理
+            if "detail_article" in group_info:
+                articles_to_save.append(group_info["detail_article"])
+    
+    if articles_to_save:
+        # 保持期間の判断
+        articles_with_periods = determine_retention_periods(articles_to_save, logger)
+        
+        # データベースへの保存
+        logger.info(f"\n{len(articles_with_periods)}件の記事をデータベースに保存します...")
+        firestore_adapter.save_essential_info_batch(db, articles_with_periods)
+        logger.info("記事の保存が完了しました")
+
 def display_analysis_results(processed_results: dict, logger: logging.Logger):
     """
     処理結果を表示します
@@ -940,9 +1297,10 @@ def display_analysis_results(processed_results: dict, logger: logging.Logger):
         logger (logging.Logger): ロガーインスタンス
     """
     logger.info("\n処理結果のサマリー：")
+    
     for group_name, group_info in processed_results["groups"].items():
         if group_name == "others":
-            logger.info(f"\n【個別記事グループ】")
+            logger.info("\n【個別記事グループ】")
             for article in group_info["processed_articles"]:
                 logger.info(f"\nメイン記事：{article['main_article']['title']}")
                 logger.info(f"URL：{article['main_article']['url']}")
@@ -960,18 +1318,19 @@ def display_analysis_results(processed_results: dict, logger: logging.Logger):
                         logger.info(f"- {pickup['title']}")
                         logger.info(f"  URL：{pickup['url']}")
                 else:
-                    logger.info("関連記事：なし")
+                    logger.info("\n関連記事：なし")
                 
-                # 記事内容の要約を表示
                 if "combined_content" in article:
                     logger.info("\n記事内容の要約：")
                     logger.info(article["combined_content"])
-                # 詳細情報記事の表示
+                
                 if "detail_article" in article:
                     logger.info("\n生成された詳細情報記事：")
                     logger.info(f"タイトル：{article['detail_article']['title']}")
-                    logger.info(f"\n本文：\n{article['detail_article']['content']}")
-                    logger.info(f"\nアイスブレイクとしての活用方法：\n{article['detail_article']['icebreak_usage']}")
+                    logger.info(f"本文：\n{article['detail_article']['content']}")
+                    logger.info(f"アイスブレイクとしての活用方法：\n{article['detail_article']['usage_example']}")
+                    if "retention_period_days" in article["detail_article"]:
+                        logger.info(f"保持期間：{article['detail_article']['retention_period_days']}日")
                 
                 logger.info("-" * 80)
         else:
@@ -994,19 +1353,27 @@ def display_analysis_results(processed_results: dict, logger: logging.Logger):
                         logger.info(f"- {pickup['title']}")
                         logger.info(f"  URL：{pickup['url']}")
                 else:
-                    logger.info("関連記事：なし")
+                    logger.info("\n関連記事：なし")
             
             if "combined_content" in group_info:
                 logger.info("\n記事内容の要約：")
                 logger.info(group_info["combined_content"])
-            # 詳細情報記事の表示
+            
             if "detail_article" in group_info:
                 logger.info("\n生成された詳細情報記事：")
                 logger.info(f"タイトル：{group_info['detail_article']['title']}")
-                logger.info(f"\n本文：\n{group_info['detail_article']['content']}")
-                logger.info(f"\nアイスブレイクとしての活用方法：\n{group_info['detail_article']['icebreak_usage']}")
+                logger.info(f"本文：\n{group_info['detail_article']['content']}")
+                logger.info(f"アイスブレイクとしての活用方法：\n{group_info['detail_article']['usage_example']}")
+                if "retention_period_days" in group_info["detail_article"]:
+                    logger.info(f"保持期間：{group_info['detail_article']['retention_period_days']}日")
             
             logger.info("-" * 80)
+
+# contentに日付や情報源、時系列の情報が含まれていないため、信頼感の無い情報にみえる
+# 保険に活用できる話題かどうかの見積もりが甘く、飛躍した関連性を見出してい待っている
+# referenced_articlesにデータが保存されていない　→　修正済み。テスト未実施
+# usage_exampleが「どういった顧客に」の部分を「社会保障に興味がある顧客」のように具体性を伴わない手抜きの情報にしている
+# →　各プロンプトの見直しが必要
 
 def main():
     """メイン処理"""
@@ -1014,35 +1381,33 @@ def main():
     logger = logging.getLogger(__name__)
 
     try:
-        # 初期化
-        yns = YahooNewsScraper()
-        fa = FirestoreAdapter()
-
         # 記事収集パイプライン
-        scraped_articles = scrape_news_articles(yns)
-        new_articles = filter_new_articles(scraped_articles, fa)
+        scraped_articles = scrape_news_articles()
+        new_articles = filter_new_articles(scraped_articles)
 
         if new_articles:
             # 新規記事の保存
-            fa.save_discovered_articles_batch(db, new_articles)
+            firestore_adapter.save_discovered_articles_batch(db, new_articles)
             logger.info(f"Saved {len(new_articles)} new articles in batch")
 
             # 記事の選別と処理
             selected_articles = select_relevant_articles(new_articles)
             if selected_articles:
-                # 選択された記事をDB保存
-                
                 # 記事のグループ化と分析
                 grouped_results = process_article_groups(selected_articles)
                 if grouped_results:
                     # 記事URLの処理と重複除去
-                    processed_results = process_article_urls_and_remove_duplicates(grouped_results, yns)
+                    processed_results = process_article_urls_and_remove_duplicates(grouped_results)
                     
                     # 記事グループの分析
-                    analyzed_results = analyze_article_groups(processed_results, yns, logger)
+                    analyzed_results = analyze_article_groups(processed_results, logger)
                     
+
                     # 結果の表示
-                    display_analysis_results(analyzed_results, logger)
+                    # display_analysis_results(analyzed_results, logger)
+                    
+                    # 記事の処理と保存
+                    process_and_save_articles(analyzed_results, logger)
 
     except Exception as e:
         logger.error(f"Error occurred: {str(e)}", exc_info=True)

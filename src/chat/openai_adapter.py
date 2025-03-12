@@ -34,7 +34,7 @@ class OpenaiAdapter:
 
     def embedding(self, texts):
         response = self.client.embeddings.create(
-            model="text-embedding-3-large",
+            model="text-embedding-3-small",
             input=texts
         )
         return [d.embedding for d in response.data]
