@@ -34,9 +34,3 @@ def get_yahoo_news_config():
 def get_scraping_config():
     """スクレイピングの設定を取得する"""
     return SCRAPING_CONFIG
-
-# ココがポイントの記事があればスクレイピングする
-# 本質情報の検索キーワードでウェブサイトを検索して、ヒットしたものをスクレイピング
-
-#uamods-pickup > div.sc-gdv5m1-0.cuVskI
-#uamods-pickup > section > ul

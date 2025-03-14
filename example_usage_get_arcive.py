@@ -441,6 +441,7 @@ def analyze_individual_article(article: dict, logger: logging.Logger) -> Optiona
         analysis_result = analyze_individual_article_content(article_content, logger)
         if analysis_result:
             if analysis_result["has_essential_info"]:
+                article["analysis"] = analysis_result
                 logger.info("分析結果: 本質情報あり")
                 logger.info(f"ターゲット顧客: {analysis_result['target_customers']}")
                 logger.info(f"本質情報: {analysis_result['extracted_info']}")
@@ -501,12 +502,12 @@ def analyze_individual_article_content(article_content: dict, logger: logging.Lo
         insurance_relevance = initial_result.get("insurance_relevance", {})
         
         # 第1段階：会話の導入と保険との関連性の確認
-        if not (conversation_starter.get("is_appropriate", False) and insurance_relevance.get("is_relevant", False)):
+        if not (conversation_starter.get("is_appropriate", False) and insurance_relevance.get("is_usable", False)):
             logger.info("初期分析: 会話の導入または保険との関連性が不適切と判断されました")
             reasons = []
             if not conversation_starter.get("is_appropriate", False):
                 reasons.append(f"会話の導入として不適切: {conversation_starter.get('reasoning', '理由不明')}")
-            if not insurance_relevance.get("is_relevant", False):
+            if not insurance_relevance.get("is_usable", False):
                 reasons.append(f"保険との関連性が不適切: {insurance_relevance.get('reasoning', '理由不明')}")
             return {
                 "has_essential_info": False,
@@ -516,7 +517,8 @@ def analyze_individual_article_content(article_content: dict, logger: logging.Lo
         # 第2段階：保険との関連性の再検証
         validation_prompt = get_relevance_validation_prompt().format(
             extracted_info=initial_result.get("extracted_info", ""),
-            relevance_reasoning=insurance_relevance.get("reasoning", "")
+            reasoning=insurance_relevance.get("reasoning", ""),
+            conversation_example=insurance_relevance.get("conversation_example", "")
         )
         
         validation_response = openai.openai_chat(
@@ -725,12 +727,12 @@ def analyze_article_contents(article_contents: List[dict], logger: logging.Logge
         conversation_starter = initial_result.get("conversation_starter", {})
         insurance_relevance = initial_result.get("insurance_relevance", {})
         
-        if not (conversation_starter.get("is_appropriate", False) and insurance_relevance.get("is_relevant", False)):
+        if not (conversation_starter.get("is_appropriate", False) and insurance_relevance.get("is_usable", False)):
             logger.info("初期分析: 会話の導入または保険との関連性が不適切と判断されました")
             reasons = []
             if not conversation_starter.get("is_appropriate", False):
                 reasons.append(f"会話の導入として不適切: {conversation_starter.get('reasoning', '理由不明')}")
-            if not insurance_relevance.get("is_relevant", False):
+            if not insurance_relevance.get("is_usable", False):
                 reasons.append(f"保険との関連性が不適切: {insurance_relevance.get('reasoning', '理由不明')}")
             return {
                 "has_essential_info": False,
@@ -740,7 +742,8 @@ def analyze_article_contents(article_contents: List[dict], logger: logging.Logge
         # 第2段階：関連性の検証
         validation_prompt = get_relevance_validation_prompt().format(
             extracted_info=initial_result.get("extracted_info", ""),
-            relevance_reasoning=insurance_relevance.get("reasoning", "")
+            reasoning=insurance_relevance.get("reasoning", ""),
+            conversation_example=insurance_relevance.get("conversation_example", "")
         )
         
         validation_response = openai.openai_chat(

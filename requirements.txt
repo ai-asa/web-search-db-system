@@ -1,6 +1,6 @@
 beautifulsoup4>=4.10.0
 functions-framework==3.*
-requests==2.28.1
+requests
 openai
 python-dotenv
 firebase-admin==6.3.0
